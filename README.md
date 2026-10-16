@@ -261,4 +261,4 @@ diffs/     补丁相对官方镜像原文件的 unified diff（便于审阅改�
 
 ### 致谢
 
-感谢 **Kimi K3**、**DeepSeek V4.1-Flash** 在调试过程中提供的协助，以及 **序言智能体平台** 提出的 Agent 长上下文场景需求。
+感谢 **Kimi K3**、**DeepSeek V4.1-Flash** 及序言智能体平台在调试过程中提供的协助
