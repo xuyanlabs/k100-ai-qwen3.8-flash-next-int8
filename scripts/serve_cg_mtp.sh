@@ -10,6 +10,8 @@
 set -uo pipefail
 SOCK="${DOCKER_SOCK:-unix:///var/run/docker.sock}"
 IMG="harbor.sourcefind.cn:5443/dcu/admin/base/custom:vllm0.29.0-ubuntu22.04-dtk26.04-py3.10-20260831-qwen3.8flashnext"
+GPUS="${GPUS:-4,5,6,7}"
+TP="${TP:-$(echo "$GPUS" | awk -F, '{print NF}')}"
 PORT="${PORT:-8388}"
 NSPEC="${NSPEC:-1}"
 CG_MODE="${CG_MODE:-FULL_AND_PIECEWISE}"
@@ -50,12 +52,13 @@ D run -d --name qwen38-tp4 \
   -v /data2/moe_configs:/moe_configs:ro \
   -e VLLM_TUNED_CONFIG_FOLDER=/moe_configs \
   -e VLLM_NUMA_BIND=1 \
-  -e HIP_VISIBLE_DEVICES=4,5,6,7 \
+  -e K100_TP="$TP" \
+  -e HIP_VISIBLE_DEVICES="$GPUS" \
   "$IMG" bash -c 'source /opt/dtk/env.sh; source /opt/hyhal/env.sh; \
     echo "INNER SPEC=$K100_SPEC_JSON CG=$K100_CG_JSON"; \
     exec vllm serve /models/qwen38-int8 \
       --served-model-name qwen3.8-flash-next \
-      --tensor-parallel-size 4 \
+      --tensor-parallel-size "$K100_TP" \
       --max-model-len 131072 \
       --max-num-batched-tokens 4096 \
       --max-num-seqs 64 \

@@ -110,6 +110,6 @@ except Exception as e:
     print("EXC", type(e).__name__, str(e)[:400])
 PY
 echo
-echo "=== [5] 速度（MTP 应仍是 ~31 tok/s）==="
+echo "=== [5] 速度（MTP 开、前缀缓存关时应 ~31 tok/s；默认 PC=1 约 29）==="
 bash /data2/bench_single_stream.sh 2>&1 | tail -2
 echo OAI_TEST_DONE

@@ -36,6 +36,7 @@ IMG="${IMG:-harbor.sourcefind.cn:5443/dcu/admin/base/custom:vllm0.29.0-ubuntu22.
 DATA_DIR="${DATA_DIR:-/data2}"
 MODEL_DIR="${MODEL_DIR:-$DATA_DIR/qwen38-int8-w8a8}"
 GPUS="${GPUS:-4,5,6,7}"
+TP="${TP:-$(echo "$GPUS" | awk -F, '{print NF}')}"
 PORT="${PORT:-8388}"
 MAXLEN="${MAXLEN:-262144}"
 NSPEC="${NSPEC:-1}"
@@ -61,7 +62,7 @@ echo "########## $(date) ##########"
 echo "镜像   : $IMG"
 echo "权重   : $MODEL_DIR"
 echo "配置   : MAXLEN=$MAXLEN  MTP nspec=$NSPEC  cudagraph=$CG_MODE  tool=${TOOL:-off}  reason=${REASON:-off}  prefix-cache=$PC"
-echo "显卡   : $GPUS    端口: $PORT    容器名: $NAME"
+echo "显卡   : $GPUS（$(echo "$GPUS" | awk -F, '{print NF}') 张）    TP=$TP    端口: $PORT    容器名: $NAME"
 
 echo; echo "=== 0. 起服前自检 ==="
 fail=0
@@ -100,6 +101,12 @@ if [ -d /opt/hyhal ]; then
   echo "  [OK] /opt/hyhal 存在"
 else
   echo "  [!!] 宿主缺 /opt/hyhal（由 DTK/驱动安装提供），容器内需要它"; fail=1
+fi
+ngpu=$(echo "$GPUS" | awk -F, '{print NF}')
+if [ "$TP" = "$ngpu" ]; then
+  echo "  [OK] tensor-parallel-size=$TP（与显卡张数一致）"
+else
+  echo "  [!?] TP=$TP 与显卡张数 $ngpu 不一致 —— 不一定是错（例如 4 卡跑两个 TP2 实例），请确认这是你要的拓扑"
 fi
 if [ "$fail" = "1" ]; then
   echo; echo "自检未通过，已停在起服之前（什么容器都没动）。"; exit 1
@@ -142,6 +149,7 @@ D run -d --name "$NAME" \
   -e K100_TOOL="$TOOL" \
   -e K100_REASON="$REASON" \
   -e K100_PC_FLAG="$PC_FLAG" \
+  -e K100_TP="$TP" \
   -v "$CACHE_DIR":/root/.cache/vllm \
   -v "$MOE_DIR":/moe_configs:ro \
   -e VLLM_TUNED_CONFIG_FOLDER=/moe_configs \
@@ -151,7 +159,7 @@ D run -d --name "$NAME" \
     echo "INNER maxlen=$K100_MAXLEN spec=$K100_SPEC_JSON tool=$K100_TOOL reason=$K100_REASON cg=$K100_CG_JSON pc=$K100_PC_FLAG"; \
     exec vllm serve /models/qwen38-int8 \
       --served-model-name qwen3.8-flash-next \
-      --tensor-parallel-size 4 \
+      --tensor-parallel-size "$K100_TP" \
       --max-model-len "$K100_MAXLEN" \
       --max-num-batched-tokens 4096 \
       --max-num-seqs 64 \
