@@ -1,0 +1,9 @@
+# 全部文本文件强制 LF 行尾（脚本要在 Linux 上跑，CRLF 会让 bash/python shebang 报 \r 错）
+* text=auto eol=lf
+
+# 明确标出二进制类型，避免被当成文本处理
+*.tar   binary
+*.gz    binary
+*.safetensors binary
+*.bin   binary
+*.pt    binary

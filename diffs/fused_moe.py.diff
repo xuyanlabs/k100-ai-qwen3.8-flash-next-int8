@@ -1,0 +1,126 @@
+--- /data2/patches/fused_moe.py.orig	2026-10-14 15:07:06.172403563 +0800
++++ /data2/patches/fused_moe.py	2026-10-15 15:55:48.776150042 +0800
+@@ -9,6 +9,30 @@
+ 
+ import torch
+ 
++_MOEDBG = os.environ.get("MOEDBG") == "1"
++_MOESTAGE = os.environ.get("MOESTAGE") == "1"
++
++
++def _moe_dbg(tag: str) -> None:
++    # 仅 eager 调试用(compiled 下会被 dynamo 抹除,别在编译路径指望它)
++    if _MOEDBG and not torch.compiler.is_compiling():
++        torch.cuda.synchronize()
++        print(f"MOEDBG {tag}", flush=True)
++
++
++def _moe_stage(tag: str, t=None) -> None:
++    # fused_experts_impl 分级解剖: 每段同步+统计, 崩在最后打印的那段之后
++    if _MOESTAGE and not torch.compiler.is_compiling():
++        torch.cuda.synchronize()
++        extra = ""
++        if t is not None:
++            with torch.no_grad():
++                tf = t.float()
++                extra = (f" nan={bool(tf.isnan().any())} "
++                         f"absmax={tf.abs().max().item() if tf.numel() else -1:.4f} "
++                         f"nz={int((tf != 0).sum())}/{tf.numel()}")
++        print(f"MOESTAGE {tag}{extra}", flush=True)
++
+ import vllm.envs as envs
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+ from vllm import _custom_ops as ops
+@@ -819,6 +843,24 @@
+         assert A_scale is None
+         assert B_scale is None
+ 
++    # [patch] gfx928/CDNA2: padding blocks from moe_align_block_size can carry
++    # wild expert_ids, and the kernel dereferences B/B_scale at that index
++    # unconditionally. On CUDA this survives by allocator-layout luck; on DTK
++    # it hits unmapped pages -> VMFault. Clamp to a valid local expert; padded
++    # blocks' outputs are masked out downstream, so numerics are unaffected.
++    if _MOEDBG and not torch.compiler.is_compiling():
++        torch.cuda.synchronize()
++        _ei = expert_ids
++        print(
++            f"MOEDBG invoke M={A.size(0)} K={A.size(1)} topk={top_k} "
++            f"sorted={'None' if sorted_token_ids is None else sorted_token_ids.size(0)} "
++            f"eids={tuple(_ei.shape)} emin={int(_ei.min()) if _ei.numel() else '-'} "
++            f"emax={int(_ei.max()) if _ei.numel() else '-'} B0={B.size(0)} "
++            f"N={B.size(1)} Asc={A_scale is not None} dt={A.dtype}",
++            flush=True,
++        )
++    expert_ids = expert_ids.clamp(min=0, max=B.size(0) - 1)
++
+     M = A.size(0)
+     num_tokens = M * top_k
+     if sorted_token_ids is not None:
+@@ -1569,6 +1611,17 @@
+         )
+     )
+ 
++    if _MOEDBG and not torch.compiler.is_compiling():
++        torch.cuda.synchronize()
++        print(
++            f"MOEDBG align nt={num_tokens} tk={top_k_num} E={global_num_experts} "
++            f"naive={naive_block_assignment} ids={tuple(topk_ids.shape)} "
++            f"imin={int(topk_ids.min()) if topk_ids.numel() else '-'} "
++            f"imax={int(topk_ids.max()) if topk_ids.numel() else '-'} "
++            f"emap={expert_map is not None}",
++            flush=True,
++        )
++
+     if naive_block_assignment:
+         return (
+             None,
+@@ -1774,6 +1827,7 @@
+         per_act_token_quant=per_channel_quant,
+         block_shape=block_shape,
+     )
++    _moe_stage("s1_quantA", qhidden_states)
+ 
+     sorted_token_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
+         topk_ids,
+@@ -1787,6 +1841,7 @@
+         block_shape=block_shape,
+         ignore_invalid_experts=True,
+     )
++    _moe_stage(f"s2_assign naive={sorted_token_ids is None}")
+ 
+     dispatch_fused_moe_kernel(
+         qhidden_states,
+@@ -1811,10 +1866,12 @@
+         block_shape=block_shape,
+         B_bias=w1_bias,
+     )
++    _moe_stage("s3_gemm1", intermediate_cache1)
+ 
+     apply_moe_activation(
+         activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+     )
++    _moe_stage("s4_silu", intermediate_cache2)
+ 
+     qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+         A=intermediate_cache2,
+@@ -1823,6 +1880,7 @@
+         per_act_token_quant=per_channel_quant,
+         block_shape=block_shape,
+     )
++    _moe_stage("s5_quant2", qintermediate_cache2)
+ 
+     if expert_map is not None:
+         intermediate_cache3.zero_()
+@@ -1850,10 +1908,12 @@
+         block_shape=block_shape,
+         B_bias=w2_bias,
+     )
++    _moe_stage("s6_gemm2", intermediate_cache3)
+ 
+     ops.moe_sum(
+         intermediate_cache3.view(*intermediate_cache3.size()),
+         out_hidden_states,
+     )
++    _moe_stage("s7_moesum", out_hidden_states)
+ 
+     return out_hidden_states

@@ -1,0 +1,21 @@
+BSD Zero Clause License (0BSD)
+
+Copyright (C) 2026 The contributors of this repository
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+--------------------------------------------------------------------------
+适用范围 / Scope:
+- 本仓库中 patches/ 目录以外的全部内容适用上述 0BSD 条款。
+- patches/ 目录下的文件来自 vLLM 项目，适用 Apache-2.0，
+  详见 patches/NOTICE.md 与 patches/LICENSE-APACHE-2.0.txt。
+- 模型权重与容器镜像不随本仓库分发，版权与许可归各自发布方所有。

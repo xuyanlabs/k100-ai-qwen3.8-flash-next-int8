@@ -1,0 +1,16 @@
+--- /data2/patches/warmup.py.orig	2026-10-14 20:39:30.089240076 +0800
++++ /data2/patches/warmup.py	2026-10-14 20:42:20.457247221 +0800
+@@ -221,6 +221,13 @@
+     We must call the provided worker's execute_model for pipeline parallel
+     coordination.
+     """
++    # [patch] gfx928 调试期:跳过全套热身(在 K100 上要磨 1 小时+)。
++    # 代价=首个真实请求承担 JIT 编译延迟,可接受。
++    import os
++    if os.getenv("VLLM_SKIP_WARMUP", "0") == "1":
++        logger.warning("[patch] VLLM_SKIP_WARMUP=1, 跳过 warmup_kernels")
++        return
++
+     if model_runner.vllm_config.is_mm_encoder_only:
+         return
+ 

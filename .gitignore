@@ -1,0 +1,16 @@
+# 本仓库只放文本补丁与脚本；下列大件一律不入库
+*.tar
+*.tar.gz
+*.tgz
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.onnx
+
+# 运行期产物
+_bundle/
+*.log
+__pycache__/
+*.pyc

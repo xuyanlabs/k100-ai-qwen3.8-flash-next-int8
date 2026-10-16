@@ -1,0 +1,58 @@
+--- /data2/patches/qwen_gdn_linear_attn.py.orig	2026-10-15 00:50:35.421871964 +0800
++++ /data2/patches/qwen_gdn_linear_attn.py	2026-10-15 00:56:08.109885918 +0800
+@@ -59,6 +59,38 @@
+ from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+ from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+ from vllm.triton_utils import tl, triton
++
++# [patch] gfx928 decode 崩溃定位:GDN_DECODE_DEBUG=1 时,对 decode 路径的
++# 关键算子逐个加同步+打点,崩了看最后一个标记即凶手。
++import os as _os
++import sys as _sys
++
++_GDNDBG = _os.getenv("GDN_DECODE_DEBUG", "0") == "1"
++
++
++def _dbg_wrap(name, fn):
++    def _w(*args, **kwargs):
++        if _GDNDBG:
++            print(f"[GDNDBG] >>> {name}", file=_sys.stderr, flush=True)
++            torch.cuda.synchronize()
++        r = fn(*args, **kwargs)
++        if _GDNDBG:
++            torch.cuda.synchronize()
++            print(f"[GDNDBG] <<< {name}", file=_sys.stderr, flush=True)
++        return r
++    return _w
++
++
++if _GDNDBG:
++    causal_conv1d_update = _dbg_wrap("causal_conv1d_update", causal_conv1d_update)
++    fused_recurrent_gated_delta_rule_packed_decode = _dbg_wrap(
++        "fused_recurrent_packed_decode", fused_recurrent_gated_delta_rule_packed_decode
++    )
++    fla_chunk_gated_delta_rule = _dbg_wrap("chunk_gated_delta_rule", fla_chunk_gated_delta_rule)
++    fused_post_conv_prep = _dbg_wrap("fused_post_conv_prep", fused_post_conv_prep)
++    fused_sigmoid_gating_delta_rule_update = _dbg_wrap(
++        "fused_sigmoid_gating_update", fused_sigmoid_gating_delta_rule_update
++    )
+ from vllm.utils.torch_utils import (
+     LayerNameType,
+     _encode_layer_name,
+@@ -1269,6 +1301,16 @@
+ 
+         assert isinstance(attn_metadata, GDNAttentionMetadata)
+ 
++        if _GDNDBG:
++            print(
++                f"[GDNDBG] _forward_core {self.prefix} "
++                f"prefills={attn_metadata.num_prefills} "
++                f"decodes={attn_metadata.num_decodes} "
++                f"packed={self.enable_packed_recurrent_decode}",
++                file=_sys.stderr, flush=True,
++            )
++            torch.cuda.synchronize()
++
+         if (
+             self.enable_packed_recurrent_decode
+             and attn_metadata.spec_sequence_masks is None

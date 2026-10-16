@@ -1,0 +1,130 @@
+--- /data2/patches/model.py.orig	2026-10-14 21:16:15.389332573 +0800
++++ /data2/patches/model.py	2026-10-15 13:06:50.523724811 +0800
+@@ -282,6 +282,24 @@
+         query_start_loc: torch.Tensor | None,
+         ngram_context: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        # [patch] 块级崩溃定位:GDN_DECODE_DEBUG=1 时每块边界同步+打点
++        import os as _os
++        import sys as _sys
++        _dbg = _os.getenv("GDN_DECODE_DEBUG") == "1"
++
++        def _mark(tag: str, t=None) -> None:
++            # dynamo 追踪时整点抹除(is_compiling=True);eager 运行时打点+同步
++            if _dbg and not torch.compiler.is_compiling():
++                torch.cuda.synchronize()
++                extra = ""
++                if t is not None:
++                    with torch.no_grad():
++                        tf = t.float()
++                        extra = (f" nan={bool(tf.isnan().any())} "
++                                 f"absmax={tf.abs().max().item():.4f}")
++                print(f"[LAYERDBG] L{self.layer_idx} {tag}{extra}",
++                      file=_sys.stderr, flush=True)
++
+         attn_hc = self.attn_hyper_connection
+         if self.ple is not None:
+             # PLE adds directly to the multi-stream state, so pending HC state
+@@ -308,6 +326,7 @@
+             )
+         else:
+             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
++        _mark("hc_attn_mix", block_input)
+ 
+         if self.layer_type == "linear_attention":
+             attn_out = self.linear_attn(hidden_states=block_input)
+@@ -318,12 +337,15 @@
+             )
+         else:
+             raise ValueError("Invalid layer_type")
++        _mark("attn_done", attn_out)
+ 
+         mlp_hc = self.mlp_hyper_connection
+         hidden_states, block_input, injection = mlp_hc.combine_and_mix(
+             hidden_states, attn_out, injection
+         )
++        _mark("hc_mlp_mix", block_input)
+         mlp_out = self.mlp(block_input)
++        _mark("mlp_done", mlp_out)
+         return hidden_states, mlp_out, injection
+ 
+ 
+@@ -467,6 +489,20 @@
+             self._mtp_hidden_buffer = None
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        # [patch] EMBDBG=1: 权重范数/前向输入输出范数, 分离"没装上"vs"前向清零"
++        import os as _os3
++        if _os3.getenv("EMBDBG") == "1" and not torch.compiler.is_compiling():
++            with torch.no_grad():
++                w = self.embed_tokens.weight
++                out = self.embed_tokens(input_ids)
++                print(
++                    f"EMBDBG w_norm={w.float().norm().item():.3f} "
++                    f"w_absmax={w.abs().max().item():.4f} "
++                    f"ids0={input_ids.flatten()[:6].tolist()} "
++                    f"out_norm={out.float().norm().item():.3f}",
++                    flush=True,
++                )
++                return out
+         return self.embed_tokens(input_ids)
+ 
+     def forward(
+@@ -495,6 +531,15 @@
+         block_output = None
+         injection = None
+         last_layer = None
++        # [patch] HIDPROBE=1: 首个 prefill 逐层打 hidden 范数/余弦, 定位信号死在哪层
++        import os as _os2
++        _hidprobe = _os2.getenv("HIDPROBE") == "1"
++        _hid_prev = [None]
++        if _hidprobe and not torch.compiler.is_compiling():
++            with torch.no_grad():
++                _e = hidden_states.float()
++                print(f"HIDPROBE embed norm={_e.norm().item():.3f} "
++                      f"absmax={_e.abs().max().item():.3f}", flush=True)
+         for layer_idx, layer in islice(
+             enumerate(self.layers), self.start_layer, self.end_layer
+         ):
+@@ -508,6 +553,27 @@
+                 query_start_loc=query_start_loc,
+                 ngram_context=ngram_context,
+             )
++            if (
++                _hidprobe
++                and not torch.compiler.is_compiling()
++                and hidden_states.shape[0] > 1
++            ):
++                with torch.no_grad():
++                    _hs = hidden_states.float()
++                    _n = _hs.norm().item()
++                    _am = _hs.abs().max().item()
++                    if _hid_prev[0] is not None:
++                        _c = torch.nn.functional.cosine_similarity(
++                            _hs.flatten(), _hid_prev[0].flatten(), dim=0
++                        ).item()
++                    else:
++                        _c = float("nan")
++                    _hid_prev[0] = _hs.detach().clone()
++                    print(
++                        f"HIDPROBE L{layer_idx} norm={_n:.3f} absmax={_am:.3f} "
++                        f"cos_prev={_c:.4f}",
++                        flush=True,
++                    )
+             if deepstack_input_embeds is not None and layer_idx < len(
+                 deepstack_input_embeds
+             ):
+@@ -1012,6 +1078,13 @@
+             self,
+             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+         )
++        # [patch] PLE-off 二分调试:config 里 ple_layer_ids 为空时,
++        # 丢弃 checkpoint 中的 PLE 权重(ngram 表/offsets 等),否则严格
++        # 加载器报 "no module named layers.1.ple"。
++        _cfg = getattr(self.config, "text_config", self.config)
++        _ple_ids = getattr(_cfg, "ple_layer_ids", None)
++        if _ple_ids is not None and len(_ple_ids) == 0:
++            weights = ((n, w) for n, w in weights if ".ple." not in n)
+         return loader.load_weights(weights, mapper=mapper)
+ 
+     @classmethod

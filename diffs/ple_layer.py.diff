@@ -1,0 +1,364 @@
+--- /data2/patches/ple_layer.py.orig	2026-10-14 12:01:23.635936209 +0800
++++ /data2/patches/ple_layer.py	2026-10-16 19:02:25.936243583 +0800
+@@ -3,6 +3,7 @@
+ """GPU-resident Qwen4Exp position-learning enhancement layers."""
+ 
+ import math
++import os
+ from collections.abc import Iterable, Sequence
+ 
+ import torch
+@@ -10,6 +11,7 @@
+ from torch import nn
+ 
+ from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
++from vllm.distributed import tensor_model_parallel_all_reduce
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+ from vllm.model_executor.layers.mamba.abstract import MambaBase
+@@ -20,6 +22,7 @@
+ )
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
++    get_masked_input_and_mask,
+ )
+ from vllm.model_executor.models.utils import AutoWeightsLoader
+ from vllm.transformers_utils.configs.qwen4_exp import (
+@@ -33,7 +36,7 @@
+ )
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
+-from ..common.ple import copy_ple_embedding_shard_
++from ..common.ple import compute_ple_shard_overlap, copy_ple_embedding_shard_
+ 
+ _MASK64 = (1 << 64) - 1
+ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+@@ -41,6 +44,132 @@
+ _SPLITMIX_M2 = 0x94D049BB133111EB
+ _PLE_LAYER_PRIME = 10007
+ 
++# [K100/INT8] Keep the 51.2 GB PLE table as int8 in device memory instead of
++# dequantising it to bf16 at load time.  As bf16 it costs ~25.6 GB per TP rank
++# (~41% of the per-card weight budget) and it is used by exactly ONE layer, so
++# the whole table is resident HBM doing nothing.  Keeping int8 halves it; the
++# gather dequantises only the few KB of rows a token actually reads.
++# Set K100_PLE_INT8=0 to restore the previous bf16 behaviour.
++_PLE_INT8 = os.environ.get("K100_PLE_INT8", "1") != "0"
++
++
++def _k100_drop_bf16_table(embedding: VocabParallelEmbedding) -> None:
++    """Replace the bf16 table with an empty placeholder (frees ~23.8 GiB/rank)."""
++    w = embedding.weight
++    if w.shape[0] == 0:
++        return
++    dim = w.shape[1]
++    embedding.weight = nn.Parameter(
++        torch.empty(0, dim, dtype=w.dtype, device=w.device), requires_grad=False
++    )
++    del w
++    torch.cuda.empty_cache()
++
++
++def _k100_ensure_int8_store(embedding: VocabParallelEmbedding) -> None:
++    """Allocate the int8 weight + per-row scale store, dropping the bf16 table.
++
++    Has to happen BEFORE any shard is copied in: the bf16 table is ~23.8 GiB
++    per rank and the int8 table another ~11.9 GiB, and keeping both resident
++    at once blows the card budget during loading.
++    """
++    if hasattr(embedding, "k100_q"):
++        return
++    rows = embedding.num_embeddings_per_partition
++    dim = embedding.embedding_dim
++    w = embedding.weight
++    device, out_dtype = w.device, w.dtype
++    try:
++        before = torch.cuda.memory_allocated() / 1024**3
++    except Exception:
++        before = -1.0
++    print(
++        f"[K100-PLE-INT8] table rows={rows:,} dim={dim} "
++        f"bf16_table={(rows * dim * 2) / 1024**3:.2f}GiB "
++        f"int8_table={(rows * dim) / 1024**3:.2f}GiB "
++        f"cuda_alloc_before={before:.2f}GiB",
++        flush=True,
++    )
++    # (The bf16 table was already dropped in __init__; this is a no-op safety
++    # net in case a caller built the module another way.)
++    _k100_drop_bf16_table(embedding)
++    embedding.k100_q = torch.zeros(rows, dim, dtype=torch.int8, device=device)
++    embedding.k100_scale = torch.ones(rows, dtype=torch.float32, device=device)
++    embedding.k100_out_dtype = out_dtype
++    try:
++        after = torch.cuda.memory_allocated() / 1024**3
++        reserved = torch.cuda.memory_reserved() / 1024**3
++        print(
++            f"[K100-PLE-INT8] after free+alloc: cuda_alloc={after:.2f}GiB "
++            f"reserved={reserved:.2f}GiB (net {(after - before):+.2f}GiB)",
++            flush=True,
++        )
++    except Exception:
++        pass
++
++
++def _k100_store_int8_shard(
++    embedding: VocabParallelEmbedding,
++    shard_weight: torch.Tensor,
++    shard_scale: torch.Tensor,
++    *,
++    checkpoint_start: int,
++) -> int:
++    """Copy one checkpoint int8 shard (and its per-row scale) into the TP slice."""
++    _k100_ensure_int8_store(embedding)
++    si = embedding.shard_indices
++    overlap = compute_ple_shard_overlap(
++        checkpoint_start=checkpoint_start,
++        checkpoint_rows=shard_weight.shape[0],
++        tp_start=si.org_vocab_start_index,
++        tp_end=si.org_vocab_end_index,
++    )
++    if overlap is None:
++        return 0
++    src = shard_weight.narrow(0, overlap.source_start, overlap.row_count)
++    dst = embedding.k100_q.narrow(0, overlap.destination_start, overlap.row_count)
++    ssrc = shard_scale.reshape(-1).narrow(0, overlap.source_start, overlap.row_count)
++    sdst = embedding.k100_scale.narrow(
++        0, overlap.destination_start, overlap.row_count
++    )
++    with torch.no_grad():
++        dst.copy_(src.to(device=dst.device, dtype=torch.int8))
++        sdst.copy_(ssrc.to(device=sdst.device, dtype=torch.float32))
++    return overlap.row_count
++
++
++def _k100_int8_ngram_embedding(
++    embedding: VocabParallelEmbedding,
++    ngram_ids: torch.Tensor,
++) -> torch.Tensor:
++    """Gather + dequantise from the int8 table, mirroring VocabParallelEmbedding.
++
++    The reference implementation does the dequantisation once at load time and
++    then gathers bf16 rows.  Doing it here instead is numerically identical
++    (int8 -> fp32 multiply -> bf16, the same order the loader used) but keeps
++    the resident table half the size.
++    """
++    si = embedding.shard_indices
++    if embedding.tp_size > 1:
++        masked_input, input_mask = get_masked_input_and_mask(
++            ngram_ids,
++            si.org_vocab_start_index,
++            si.org_vocab_end_index,
++            si.num_org_vocab_padding,
++            si.added_vocab_start_index,
++            si.added_vocab_end_index,
++        )
++    else:
++        masked_input, input_mask = ngram_ids, None
++    mi = masked_input.long()
++    gathered = embedding.k100_q[mi].to(torch.float32)
++    scales = embedding.k100_scale[mi].unsqueeze(-1)
++    out = (gathered * scales).to(embedding.k100_out_dtype)
++    if input_mask is not None:
++        out.masked_fill_(input_mask.unsqueeze(-1), 0)
++        out = tensor_model_parallel_all_reduce(out)
++    return out
++
+ 
+ def _splitmix64(value: int) -> int:
+     value = (value + _SPLITMIX_GAMMA) & _MASK64
+@@ -198,6 +327,17 @@
+             padding_size=divisor,
+             prefix=f"{prefix}.ngram_embedding",
+         )
++        # [K100/INT8] Never let the bf16 table exist at all.
++        #
++        # Dropping it *after* loading works at the PyTorch level (memory_allocated
++        # falls by 11.6 GiB) but the freed segment stays in the caching
++        # allocator's pool, and vLLM sizes the KV cache from *driver* free
++        # memory -- so the KV pool never saw the saving.  Releasing it here,
++        # before anything is loaded, means there is no bf16 table to free and no
++        # cache segment to get stuck in.  Arithmetic is untouched: the int8 rows
++        # and the gather are identical either way (verified bit-exact).
++        if _PLE_INT8:
++            _k100_drop_bf16_table(self.ngram_embedding)
+         self.register_buffer(
+             "positions_buffer",
+             torch.arange(max_total_tokens, dtype=torch.int64),
+@@ -357,6 +497,73 @@
+         loaded: set[str] = set()
+         regular_weights: list[tuple[str, torch.Tensor]] = []
+         shard_prefix = "ngram_embedding.shard_"
++        # [patch] INT8 W8A8 checkpoints carry per-row scales next to each int8
++        # shard ("...shard_N.weight" + "...shard_N.weight_scale"); the stock
++        # loader only handled the BF16 layout. Buffer both and dequantize
++        # (int8 * per-row scale) before copying into the TP table.
++        pending_shard_weights: dict[int, torch.Tensor] = {}
++        pending_shard_scales: dict[int, torch.Tensor] = {}
++
++        def _load_embedding_shard(
++            shard_index: int,
++            shard_weight: torch.Tensor,
++            shard_scale: torch.Tensor | None,
++        ) -> None:
++            if shard_index >= self.split_ngram_parts:
++                raise ValueError(
++                    f"PLE embedding shard index {shard_index} exceeds "
++                    f"split_ngram_parts={self.split_ngram_parts}"
++                )
++            embedding = self.ngram_embedding
++            shard_size = (
++                embedding.org_vocab_size + self.split_ngram_parts - 1
++            ) // self.split_ngram_parts
++            checkpoint_start = shard_index * shard_size
++            expected_rows = max(
++                0,
++                min(shard_size, embedding.org_vocab_size - checkpoint_start),
++            )
++            expected_shape = (expected_rows, embedding.embedding_dim)
++            if tuple(shard_weight.shape) != expected_shape:
++                raise ValueError(
++                    f"Shape mismatch for PLE embedding shard {shard_index}: "
++                    f"expected {expected_shape}, got "
++                    f"{tuple(shard_weight.shape)}"
++                )
++            if shard_weight.dtype in (torch.int8, torch.uint8):
++                if shard_scale is None:
++                    pending_shard_weights[shard_index] = shard_weight
++                    return
++                if tuple(shard_scale.shape) not in (
++                    (expected_rows, 1),
++                    (expected_rows,),
++                ):
++                    raise ValueError(
++                        f"Shape mismatch for PLE embedding shard {shard_index} "
++                        f"scale: expected ({expected_rows}, 1), got "
++                        f"{tuple(shard_scale.shape)}"
++                    )
++                if _PLE_INT8:
++                    _k100_store_int8_shard(
++                        embedding,
++                        shard_weight,
++                        shard_scale,
++                        checkpoint_start=checkpoint_start,
++                    )
++                    loaded.add("ngram_embedding.weight")
++                    return
++                shard_weight = (
++                    shard_weight.to(torch.float32)
++                    * shard_scale.to(torch.float32).reshape(-1, 1)
++                ).to(embedding.weight.dtype)
++            copy_ple_embedding_shard_(
++                embedding.weight.data,
++                shard_weight,
++                checkpoint_start=checkpoint_start,
++                tp_start=embedding.shard_indices.org_vocab_start_index,
++                tp_end=embedding.shard_indices.org_vocab_end_index,
++            )
++            loaded.add("ngram_embedding.weight")
+ 
+         for name, loaded_weight in weights:
+             leaf_name = name.rsplit(".", 1)[-1]
+@@ -372,46 +579,54 @@
+                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+                 loaded.add(name)
+                 continue
+-            if name.startswith(shard_prefix) and name.endswith(".weight"):
+-                shard_text = name[len(shard_prefix) : -len(".weight")]
+-                if not shard_text.isdigit():
+-                    regular_weights.append((name, loaded_weight))
++            if name.startswith(shard_prefix):
++                if name.endswith(".weight_scale"):
++                    shard_text = name[len(shard_prefix) : -len(".weight_scale")]
++                    if not shard_text.isdigit():
++                        regular_weights.append((name, loaded_weight))
++                        continue
++                    shard_index = int(shard_text)
++                    paired = pending_shard_weights.pop(shard_index, None)
++                    if paired is None:
++                        pending_shard_scales[shard_index] = loaded_weight
++                    else:
++                        _load_embedding_shard(shard_index, paired, loaded_weight)
++                    continue
++                if name.endswith(".weight"):
++                    shard_text = name[len(shard_prefix) : -len(".weight")]
++                    if not shard_text.isdigit():
++                        regular_weights.append((name, loaded_weight))
++                        continue
++                    shard_index = int(shard_text)
++                    if loaded_weight.dtype in (torch.int8, torch.uint8):
++                        paired_scale = pending_shard_scales.pop(shard_index, None)
++                        _load_embedding_shard(shard_index, loaded_weight, paired_scale)
++                    else:
++                        _load_embedding_shard(shard_index, loaded_weight, None)
+                     continue
+-                shard_index = int(shard_text)
+-                if shard_index >= self.split_ngram_parts:
+-                    raise ValueError(
+-                        f"PLE embedding shard index {shard_index} exceeds "
+-                        f"split_ngram_parts={self.split_ngram_parts}"
+-                    )
+-                embedding = self.ngram_embedding
+-                shard_size = (
+-                    embedding.org_vocab_size + self.split_ngram_parts - 1
+-                ) // self.split_ngram_parts
+-                checkpoint_start = shard_index * shard_size
+-                expected_rows = max(
+-                    0,
+-                    min(shard_size, embedding.org_vocab_size - checkpoint_start),
+-                )
+-                expected_shape = (expected_rows, embedding.embedding_dim)
+-                if tuple(loaded_weight.shape) != expected_shape:
+-                    raise ValueError(
+-                        f"Shape mismatch for PLE embedding shard {shard_index}: "
+-                        f"expected {expected_shape}, got "
+-                        f"{tuple(loaded_weight.shape)}"
+-                    )
+-                copy_ple_embedding_shard_(
+-                    embedding.weight.data,
+-                    loaded_weight,
+-                    checkpoint_start=checkpoint_start,
+-                    tp_start=embedding.shard_indices.org_vocab_start_index,
+-                    tp_end=embedding.shard_indices.org_vocab_end_index,
+-                )
+-                loaded.add("ngram_embedding.weight")
+-                continue
+             regular_weights.append((name, loaded_weight))
+ 
++        if pending_shard_weights:
++            missing = sorted(pending_shard_weights)
++            raise ValueError(
++                f"PLE embedding int8 shards missing weight_scale: "
++                f"{missing[:8]} ({len(missing)} total)"
++            )
++        if pending_shard_scales:
++            orphan = sorted(pending_shard_scales)
++            raise ValueError(
++                f"PLE embedding scales without matching shard weight: "
++                f"{orphan[:8]} ({len(orphan)} total)"
++            )
+         if regular_weights:
+             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
++
++        # [K100/INT8] Hand the freed bf16 table back to the driver.  PyTorch's
++        # caching allocator keeps freed segments in its pool; vLLM sizes the KV
++        # cache from *driver* free memory, so without this the ~11.9 GiB we just
++        # saved stays invisible and the KV pool barely grows.
++        if _PLE_INT8 and hasattr(self.ngram_embedding, "k100_q"):
++            torch.cuda.empty_cache()
+         return loaded
+ 
+ 
+@@ -1072,7 +1287,12 @@
+     layer = get_forward_context().no_compile_layers[layer_name]
+     if not isinstance(layer, Qwen4ExpPLELayer):
+         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+-    result = layer.ple_embedding.ngram_embedding(ngram_ids).flatten(-2)
++    emb = layer.ple_embedding.ngram_embedding
++    if _PLE_INT8 and hasattr(emb, "k100_q"):
++        result = _k100_int8_ngram_embedding(emb, ngram_ids)
++    else:
++        result = emb(ngram_ids)
++    result = result.flatten(-2)
+     output.copy_(result)
+ 
+ 
